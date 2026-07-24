@@ -74,6 +74,76 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
+PLACEHOLDER_FRAME = None
+
+
+def get_placeholder():
+    """Создает статичный темный кадр-заглушку, чтобы браузер не зависал в ожидании"""
+    global PLACEHOLDER_FRAME
+    if PLACEHOLDER_FRAME is None:
+        # Создаем простой темно-серый фон
+        img = Image.new('RGB', (640, 480), color=(30, 30, 30))
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='JPEG', quality=30)
+        PLACEHOLDER_FRAME = img_byte_arr.getvalue()
+    return PLACEHOLDER_FRAME
+
+
+def generate_frames():
+    global selected_window_title, is_streaming, STREAM_QUALITY, TARGET_FPS
+
+    frame_duration = 1.0 / TARGET_FPS
+
+    with mss.mss() as sct:
+        while True:
+            start_time = time.time()
+
+            # 1. Если стрим на паузе — отдаем заглушку
+            if not is_streaming or not selected_window_title:
+                frame = get_placeholder()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                time.sleep(0.5)  # Обновляем заглушку редко (2 кадра в секунду)
+                continue
+
+            try:
+                window = gw.getWindowsWithTitle(selected_window_title)
+
+                # 2. Если окно пропало или закрыто — тоже отдаем заглушку
+                if not window or window[0].width <= 0 or window[0].height <= 0:
+                    frame = get_placeholder()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                    time.sleep(0.5)
+                    continue
+
+                win = window[0]
+                monitor = {"top": win.top, "left": win.left, "width": win.width, "height": win.height}
+
+                # Основной захват
+                sct_img = sct.grab(monitor)
+                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+
+                img_byte_arr = io.BytesIO()
+                img.save(img_byte_arr, format='JPEG', quality=STREAM_QUALITY, optimize=False)
+                frame = img_byte_arr.getvalue()
+
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
+                # Контроль FPS
+                elapsed = time.time() - start_time
+                sleep_time = frame_duration - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            except Exception as e:
+                # В случае сбоя захвата спасаемся заглушкой
+                frame = get_placeholder()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                time.sleep(0.5)
+
 def generate_frames():
     global selected_window_title, is_streaming, STREAM_QUALITY, TARGET_FPS
 
