@@ -1,61 +1,189 @@
 import threading
-import io
+import asyncio
+import json
 import time
 import socket
 import subprocess
 import customtkinter as ctk
 import pygetwindow as gw
 import mss
-from PIL import Image
-from flask import Flask, Response, render_template_string
+import numpy as np
+
+from aiohttp import web
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from av import VideoFrame
 from zeroconf import ServiceInfo, Zeroconf
 
-# Настройка Flask
-app = Flask(__name__)
+# Глобальные переменные состояния
 selected_window_title = None
 is_streaming = False
 
-# Настройки качества и FPS по умолчанию
-STREAM_QUALITY = 65
-TARGET_FPS = 30
-
-# HTML шаблон с отключением кэширования для минимальной задержки
+# HTML + JavaScript для WebRTC клиента
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>USB Stream</title>
+    <title>WebRTC Stream</title>
     <style>
         body { margin: 0; background-color: #000; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
-        img { max-width: 100%; max-height: 100vh; object-fit: contain; }
+        video { max-width: 100%; max-height: 100vh; object-fit: contain; }
+        #status { position: absolute; top: 10px; left: 10px; color: #00ff00; font-family: monospace; background: rgba(0,0,0,0.5); padding: 5px; }
     </style>
 </head>
 <body>
-    <img src="/video_feed" alt="Screen Stream">
+    <div id="status">Connecting WebRTC...</div>
+    <video id="video" autoplay playsinline></video>
+    <script>
+        async function start() {
+            const pc = new RTCPeerConnection();
+
+            pc.addEventListener('track', function(evt) {
+                if (evt.track.kind === 'video') {
+                    document.getElementById('video').srcObject = evt.streams[0];
+                    document.getElementById('status').innerText = 'WebRTC Connected (Live)';
+                }
+            });
+
+            pc.addTransceiver('video', {direction: 'recvonly'});
+
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            const response = await fetch('/offer', {
+                body: JSON.stringify({
+                    sdp: pc.localDescription.sdp,
+                    type: pc.localDescription.type
+                }),
+                headers: {'Content-Type': 'application/json'},
+                method: 'POST'
+            });
+
+            const answer = await response.json();
+            await pc.setRemoteDescription(answer);
+        }
+        start();
+    </script>
 </body>
 </html>
 """
 
 
+class WindowCaptureTrack(VideoStreamTrack):
+    """Кастомный видео-трек для WebRTC, захватывающий окно"""
+    kind = "video"
+
+    def __init__(self):
+        super().__init__()
+        self.sct = mss.mss()
+
+    async def recv(self):
+        # Получаем временную метку для кадра (обязательно для WebRTC)
+        pts, time_base = await self.next_timestamp()
+
+        global selected_window_title, is_streaming
+
+        # Функция для создания черного экрана (заглушки), если стрим на паузе
+        def get_blank_frame():
+            img_np = np.zeros((480, 640, 4), dtype=np.uint8)
+            return VideoFrame.from_ndarray(img_np, format="bgra")
+
+        try:
+            if not is_streaming or not selected_window_title:
+                frame = get_blank_frame()
+            else:
+                windows = gw.getWindowsWithTitle(selected_window_title)
+                if not windows or windows[0].width <= 0 or windows[0].height <= 0:
+                    frame = get_blank_frame()
+                else:
+                    win = windows[0]
+                    monitor = {"top": win.top, "left": win.left, "width": win.width, "height": win.height}
+
+                    # Захват и конвертация в numpy массив
+                    sct_img = self.sct.grab(monitor)
+                    img_np = np.array(sct_img)
+
+                    # Передаем напрямую как BGRA (минимальная задержка)
+                    frame = VideoFrame.from_ndarray(img_np, format="bgra")
+
+            frame.pts = pts
+            frame.time_base = time_base
+            return frame
+
+        except Exception as e:
+            frame = get_blank_frame()
+            frame.pts = pts
+            frame.time_base = time_base
+            return frame
+
+
+# --- AIOHTTP Server ---
+pcs = set()
+
+
+async def index(request):
+    return web.Response(content_type='text/html', text=HTML_TEMPLATE)
+
+
+async def offer(request):
+    params = await request.json()
+    offer_sdp = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+
+    pc = RTCPeerConnection()
+    pcs.add(pc)
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        if pc.connectionState in ["failed", "closed"]:
+            pcs.discard(pc)
+
+    # Добавляем наш кастомный трек с захватом экрана
+    pc.addTrack(WindowCaptureTrack())
+
+    # Устанавливаем соединение
+    await pc.setRemoteDescription(offer_sdp)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    return web.json_response({
+        "sdp": pc.localDescription.sdp,
+        "type": pc.localDescription.type
+    })
+
+
+async def on_shutdown(app):
+    coros = [pc.close() for pc in pcs]
+    await asyncio.gather(*coros)
+    pcs.clear()
+
+
+def run_server():
+    # Настраиваем асинхронный цикл событий для отдельного потока
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    app = web.Application()
+    app.on_shutdown.append(on_shutdown)
+    app.router.add_get('/', index)
+    app.router.add_post('/offer', offer)
+
+    # handle_signals=False крайне важен, так как сервер запускается не в главном потоке
+    web.run_app(app, host='0.0.0.0', port=5000, handle_signals=False)
+
+
+# --- GUI ---
 def get_all_ip_addresses():
-    """Получение всех локальных IPv4 адресов (включая USB Tethering)"""
     ip_list = []
     try:
-        # Получаем имя хоста и все связанные IP
         hostname = socket.gethostname()
         addresses = socket.getaddrinfo(hostname, None)
         for addr in addresses:
             ip = addr[4][0]
-            # Отфильтровываем IPv6 и loopback
-            if ":" not in ip and not ip.startswith("127."):
-                if ip not in ip_list:
-                    ip_list.append(ip)
+            if ":" not in ip and not ip.startswith("127.") and ip not in ip_list:
+                ip_list.append(ip)
     except Exception:
         pass
-
-    # Резервный способ получения IP через подключение к внешнему сокету
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -65,157 +193,19 @@ def get_all_ip_addresses():
             ip_list.append(main_ip)
     except Exception:
         pass
-
     return ip_list
-
-
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-
-PLACEHOLDER_FRAME = None
-
-
-def get_placeholder():
-    """Создает статичный темный кадр-заглушку, чтобы браузер не зависал в ожидании"""
-    global PLACEHOLDER_FRAME
-    if PLACEHOLDER_FRAME is None:
-        # Создаем простой темно-серый фон
-        img = Image.new('RGB', (640, 480), color=(30, 30, 30))
-        img_byte_arr = io.BytesIO()
-        img.save(img_byte_arr, format='JPEG', quality=30)
-        PLACEHOLDER_FRAME = img_byte_arr.getvalue()
-    return PLACEHOLDER_FRAME
-
-
-def generate_frames():
-    global selected_window_title, is_streaming, STREAM_QUALITY, TARGET_FPS
-
-    frame_duration = 1.0 / TARGET_FPS
-
-    with mss.mss() as sct:
-        while True:
-            start_time = time.time()
-
-            # 1. Если стрим на паузе — отдаем заглушку
-            if not is_streaming or not selected_window_title:
-                frame = get_placeholder()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                time.sleep(0.5)  # Обновляем заглушку редко (2 кадра в секунду)
-                continue
-
-            try:
-                window = gw.getWindowsWithTitle(selected_window_title)
-
-                # 2. Если окно пропало или закрыто — тоже отдаем заглушку
-                if not window or window[0].width <= 0 or window[0].height <= 0:
-                    frame = get_placeholder()
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                    time.sleep(0.5)
-                    continue
-
-                win = window[0]
-                monitor = {"top": win.top, "left": win.left, "width": win.width, "height": win.height}
-
-                # Основной захват
-                sct_img = sct.grab(monitor)
-                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-
-                img_byte_arr = io.BytesIO()
-                img.save(img_byte_arr, format='JPEG', quality=STREAM_QUALITY, optimize=False)
-                frame = img_byte_arr.getvalue()
-
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
-                # Контроль FPS
-                elapsed = time.time() - start_time
-                sleep_time = frame_duration - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
-            except Exception as e:
-                # В случае сбоя захвата спасаемся заглушкой
-                frame = get_placeholder()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                time.sleep(0.5)
-
-def generate_frames():
-    global selected_window_title, is_streaming, STREAM_QUALITY, TARGET_FPS
-
-    frame_duration = 1.0 / TARGET_FPS
-
-    with mss.mss() as sct:
-        while True:
-            start_time = time.time()
-
-            if not is_streaming or not selected_window_title:
-                time.sleep(0.05)
-                continue
-
-            try:
-                window = gw.getWindowsWithTitle(selected_window_title)
-                if not window:
-                    time.sleep(0.2)
-                    continue
-
-                win = window[0]
-                if win.width <= 0 or win.height <= 0:
-                    time.sleep(0.2)
-                    continue
-
-                monitor = {"top": win.top, "left": win.left, "width": win.width, "height": win.height}
-
-                sct_img = sct.grab(monitor)
-                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-
-                img_byte_arr = io.BytesIO()
-                # Сохраняем в JPEG с оптимизацией
-                img.save(img_byte_arr, format='JPEG', quality=STREAM_QUALITY, optimize=False)
-                frame = img_byte_arr.getvalue()
-
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
-                # Контроль FPS
-                elapsed = time.time() - start_time
-                sleep_time = frame_duration - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
-            except Exception as e:
-                time.sleep(0.1)
-
-
-@app.route('/video_feed')
-def video_feed():
-    response = Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '0'
-    return response
-
-
-def run_flask():
-    app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
 
 
 class StreamApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("USB & LAN Screen Streamer")
-        self.geometry("450x520")
+        self.title("WebRTC Zero-Latency Streamer")
+        self.geometry("450x450")
         ctk.set_appearance_mode("dark")
-
         self.grid_columnconfigure(0, weight=1)
 
-        # UI Элементы
-        self.label = ctk.CTkLabel(self, text="Захват окна:", font=("Arial", 15, "bold"))
+        self.label = ctk.CTkLabel(self, text="Захват окна (WebRTC):", font=("Arial", 15, "bold"))
         self.label.grid(row=0, column=0, pady=(15, 5))
 
         self.window_combobox = ctk.CTkComboBox(self, values=self.get_window_list(), width=340)
@@ -224,22 +214,12 @@ class StreamApp(ctk.CTk):
         self.refresh_btn = ctk.CTkButton(self, text="Обновить список окон", command=self.refresh_windows, width=200)
         self.refresh_btn.grid(row=2, column=0, pady=5)
 
-        # Настройки качества
-        self.quality_label = ctk.CTkLabel(self, text=f"Качество JPEG: {STREAM_QUALITY}%")
-        self.quality_label.grid(row=3, column=0, pady=(10, 0))
-
-        self.quality_slider = ctk.CTkSlider(self, from_=30, to=95, number_of_steps=13, command=self.update_quality)
-        self.quality_slider.set(STREAM_QUALITY)
-        self.quality_slider.grid(row=4, column=0, pady=5)
-
-        # Кнопка управления
         self.stream_btn = ctk.CTkButton(self, text="Запустить трансляцию", fg_color="green", font=("Arial", 14, "bold"),
                                         height=40, command=self.toggle_stream)
-        self.stream_btn.grid(row=5, column=0, pady=15)
+        self.stream_btn.grid(row=3, column=0, pady=(20, 15))
 
-        # Текстовое поле с адресами подключения
         self.info_text = ctk.CTkTextbox(self, width=380, height=140, font=("Consolas", 12))
-        self.info_text.grid(row=6, column=0, pady=10)
+        self.info_text.grid(row=4, column=0, pady=10)
 
         self.update_ip_info()
 
@@ -250,13 +230,7 @@ class StreamApp(ctk.CTk):
     def refresh_windows(self):
         self.window_combobox.configure(values=self.get_window_list())
 
-    def update_quality(self, value):
-        global STREAM_QUALITY
-        STREAM_QUALITY = int(value)
-        self.quality_label.configure(text=f"Качество JPEG: {STREAM_QUALITY}%")
-
     def try_adb_reverse(self):
-        """Попытка выполнения ADB reverse для трансляции по USB через localhost"""
         try:
             result = subprocess.run(["adb", "reverse", "tcp:5000", "tcp:5000"], capture_output=True, text=True,
                                     timeout=2)
@@ -269,22 +243,14 @@ class StreamApp(ctk.CTk):
     def update_ip_info(self):
         self.info_text.configure(state="normal")
         self.info_text.delete("1.0", "end")
-
         text = "--- ССЫЛКИ ДЛЯ ПОДКЛЮЧЕНИЯ ---\n\n"
-
-        # Проверка ADB
         if self.try_adb_reverse():
             text += "[USB ADB Подключено!]\n-> http://localhost:5000\n\n"
-
-        # Поиск остальных IP (включая USB Tethering)
         ips = get_all_ip_addresses()
         if ips:
             text += "[USB-Модем / Wi-Fi / LAN]:\n"
             for ip in ips:
                 text += f"-> http://{ip}:5000\n"
-
-        text += "\n[mDNS]: http://stream.local:5000"
-
         self.info_text.insert("1.0", text)
         self.info_text.configure(state="disabled")
 
@@ -301,6 +267,8 @@ class StreamApp(ctk.CTk):
 
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
+    # Запуск асинхронного WebRTC сервера в фоновом потоке
+    threading.Thread(target=run_server, daemon=True).start()
+
     app_gui = StreamApp()
     app_gui.mainloop()
