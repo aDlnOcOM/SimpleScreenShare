@@ -8,6 +8,7 @@ import customtkinter as ctk
 import pygetwindow as gw
 import mss
 import numpy as np
+from PIL import Image
 
 from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
@@ -77,45 +78,85 @@ class WindowCaptureTrack(VideoStreamTrack):
     def __init__(self):
         super().__init__()
         self.sct = mss.mss()
+        self.last_frame = None
+        self.target_size = None  # Фиксированное разрешение стрима
 
     async def recv(self):
-        # Получаем временную метку для кадра (обязательно для WebRTC)
-        pts, time_base = await self.next_timestamp()
-
         global selected_window_title, is_streaming
 
-        # Функция для создания черного экрана (заглушки), если стрим на паузе
-        def get_blank_frame():
-            img_np = np.zeros((480, 640, 4), dtype=np.uint8)
-            return VideoFrame.from_ndarray(img_np, format="bgra")
-
-        try:
+        while True:
+            # 1. Если стрим на паузе или окно не выбрано
             if not is_streaming or not selected_window_title:
-                frame = get_blank_frame()
-            else:
+                if self.last_frame is not None:
+                    # Отдаем последний успешный кадр (замораживаем картинку)
+                    pts, time_base = await self.next_timestamp()
+                    frame = self.last_frame
+                    frame.pts = pts
+                    frame.time_base = time_base
+                    await asyncio.sleep(0.1)  # Снижаем нагрузку (10 FPS в простое)
+                    return frame
+                else:
+                    # Если стрим еще ни разу не запускался — просто ждем
+                    await asyncio.sleep(0.1)
+                    continue
+
+            # 2. Если трансляция активна
+            try:
                 windows = gw.getWindowsWithTitle(selected_window_title)
                 if not windows or windows[0].width <= 0 or windows[0].height <= 0:
-                    frame = get_blank_frame()
+                    raise Exception("Окно не найдено или свернуто")
+
+                win = windows[0]
+
+                # КРИТИЧЕСКИ ВАЖНО: Делаем ширину и высоту четными (требование H.264)
+                w = win.width - (win.width % 2)
+                h = win.height - (win.height % 2)
+
+                if w <= 0 or h <= 0:
+                    raise Exception("Некорректный размер окна")
+
+                # При первом успешном кадре жестко фиксируем разрешение трансляции
+                if self.target_size is None:
+                    self.target_size = (w, h)
+
+                monitor = {"top": win.top, "left": win.left, "width": w, "height": h}
+
+                # Асинхронный захват (чтобы не блокировать внутренние таймеры WebRTC)
+                loop = asyncio.get_event_loop()
+                sct_img = await loop.run_in_executor(None, self.sct.grab, monitor)
+
+                # Переводим в PIL (это сразу удалит проблемный Альфа-канал / прозрачность)
+                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+
+                # Если пользователь растянул/уменьшил окно в процессе — подгоняем под изначальный размер,
+                # чтобы не сломать кодек изменением разрешения.
+                if img.size != self.target_size:
+                    img = img.resize(self.target_size)
+
+                img_np = np.array(img)
+
+                # Формируем готовый видеокадр
+                frame = VideoFrame.from_ndarray(img_np, format="rgb24")
+
+                pts, time_base = await self.next_timestamp()
+                frame.pts = pts
+                frame.time_base = time_base
+                self.last_frame = frame
+
+                return frame
+
+            except Exception as e:
+                # Если окно случайно закрыли или свернули — спасаемся последним кадром
+                if self.last_frame is not None:
+                    pts, time_base = await self.next_timestamp()
+                    frame = self.last_frame
+                    frame.pts = pts
+                    frame.time_base = time_base
+                    await asyncio.sleep(0.1)
+                    return frame
                 else:
-                    win = windows[0]
-                    monitor = {"top": win.top, "left": win.left, "width": win.width, "height": win.height}
-
-                    # Захват и конвертация в numpy массив
-                    sct_img = self.sct.grab(monitor)
-                    img_np = np.array(sct_img)
-
-                    # Передаем напрямую как BGRA (минимальная задержка)
-                    frame = VideoFrame.from_ndarray(img_np, format="bgra")
-
-            frame.pts = pts
-            frame.time_base = time_base
-            return frame
-
-        except Exception as e:
-            frame = get_blank_frame()
-            frame.pts = pts
-            frame.time_base = time_base
-            return frame
+                    await asyncio.sleep(0.1)
+                    continue
 
 
 # --- AIOHTTP Server ---
