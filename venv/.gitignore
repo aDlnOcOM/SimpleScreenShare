@@ -1,0 +1,34 @@
+# Специфичные файлы PyCharm / IntelliJ IDE
+*
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+
+# Кэш байт-кода Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Виртуальные окружения (где хранятся установленные библиотеки)
+venv/
+env/
+.env/
+.venv/
+
+# Папки и файлы сборки PyInstaller (появятся после компиляции EXE)
+build/
+dist/
+*.spec
+*.manifest
+
+# Логи и кэш
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# Системные файлы ОС (если будете работать с разных систем)
+.DS_Store
+Thumbs.db
